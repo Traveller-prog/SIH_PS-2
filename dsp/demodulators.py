@@ -9,8 +9,14 @@ Conventions
   QPSK/QAM). Pass differential=True if the transmitter used differential encoding.
 """
 
+import cmath
+import math
+
 import numpy as np
+from scipy import fft as sfft
 from scipy import signal
+
+from dsp.spectral import shift_frequency
 
 SUPPORTED = ("2-FSK", "4-FSK", "BPSK", "QPSK", "16-QAM", "64-QAM")
 
@@ -65,7 +71,11 @@ def demod_fsk(iq, sample_rate, symbol_rate, order=2):
 
     # Symbol timing: windows aligned to symbol edges give the most spread-out averages.
     offsets = np.linspace(0, sps, 16, endpoint=False)
-    best = max(offsets, key=lambda o: np.var(_window_means(disc, sps, o)))
+    csum = np.concatenate([[0.0], np.cumsum(disc)])  # one cumulative sum shared by every offset
+    n_win = int((len(disc) - offsets[-1]) // sps) + 1
+    idx = np.clip(np.round(offsets[:, None] + sps * np.arange(n_win)).astype(np.intp), 0, len(disc))
+    means = (csum[idx[:, 1:]] - csum[idx[:, :-1]]) / np.maximum(np.diff(idx, axis=1), 1)
+    best = offsets[int(np.argmax(means.var(axis=1)))]
     vals = _window_means(disc, sps, best)
 
     if order == 2:
@@ -78,15 +88,15 @@ def demod_fsk(iq, sample_rate, symbol_rate, order=2):
 
 
 def _interp_cubic(x, pos):
-    i = int(np.floor(pos))
+    """Cubic Lagrange interpolation of x (a list or array) at fractional index pos."""
+    i = math.floor(pos)
     mu = pos - i
-    c = (
-        -mu * (mu - 1) * (mu - 2) / 6.0,
-        (mu + 1) * (mu - 1) * (mu - 2) / 2.0,
-        -(mu + 1) * mu * (mu - 2) / 2.0,
-        (mu + 1) * mu * (mu - 1) / 6.0,
+    return (
+        -mu * (mu - 1) * (mu - 2) / 6.0 * x[i - 1]
+        + (mu + 1) * (mu - 1) * (mu - 2) / 2.0 * x[i]
+        - (mu + 1) * mu * (mu - 2) / 2.0 * x[i + 1]
+        + (mu + 1) * mu * (mu - 1) / 6.0 * x[i + 2]
     )
-    return c[0] * x[i - 1] + c[1] * x[i] + c[2] * x[i + 1] + c[3] * x[i + 2]
 
 
 def _pi_gains(bandwidth, damping=0.7071):
@@ -98,9 +108,9 @@ def _pi_gains(bandwidth, damping=0.7071):
 def _coarse_cfo_correct(iq, power):
     """Remove carrier offset via the power-law spectral line (2 = BPSK, 4 = QPSK/QAM)."""
     n_fft = 1 << int(np.ceil(np.log2(len(iq)))) + 3
-    spec = np.abs(np.fft.fft(iq ** power, n_fft))
-    freq = np.fft.fftfreq(n_fft)[np.argmax(spec)] / power
-    return iq * np.exp(-2j * np.pi * freq * np.arange(len(iq)))
+    z = sfft.fft(iq ** power, n_fft, workers=-1)
+    freq = sfft.fftfreq(n_fft)[np.argmax(z.real ** 2 + z.imag ** 2)] / power
+    return shift_frequency(iq, -freq).astype(np.complex128, copy=False)
 
 
 def gardner_timing_recovery(iq, sps, bandwidth=0.02):
@@ -113,26 +123,35 @@ def gardner_timing_recovery(iq, sps, bandwidth=0.02):
     half = sps / 2.0
     power = np.abs(iq) ** 2
     starts = np.arange(0.0, sps, 0.25)
-    metric = [
-        np.mean(power[np.round(o + sps * np.arange(int((len(iq) - o - 2) // sps))).astype(int)])
-        for o in starts
-    ]
-    pos = starts[int(np.argmax(metric))] + sps + 1.0
-    prev = _interp_cubic(iq, pos)
-    out = [prev]
+    n_sym = int((len(iq) - starts[-1] - 2) // sps)  # symbols available at every start
+    metric = power[np.round(starts[:, None] + sps * np.arange(n_sym)).astype(np.intp)].mean(axis=1)
+    pos = float(starts[int(np.argmax(metric))] + sps + 1.0)  # plain floats: NumPy scalars make the loop 2x slower
+    sps, kp, ki, half = float(sps), float(kp), float(ki), float(half)
+
+    # The loop is a feedback recursion (each step depends on the last error), so it cannot be
+    # vectorized. Python-list samples make the scalar interpolation cheap; the output array grows
+    # geometrically instead of a list of NumPy scalars being converted at the end.
+    xs = iq.tolist()
+    out = np.empty(int(len(iq) / sps) + 16, dtype=np.complex128)
+    prev = _interp_cubic(xs, pos)
+    out[0] = prev
+    count = 1
     integ = 0.0
-    while pos + sps + 2 < len(iq) - 2:
+    while pos + sps + 2 < len(xs) - 2:
         pos_next = pos + sps
-        cur = _interp_cubic(iq, pos_next)
-        mid = _interp_cubic(iq, pos_next - half)
-        err = -np.real(np.conj(mid) * (cur - prev))
-        err = np.clip(err, -1.0, 1.0)
+        cur = _interp_cubic(xs, pos_next)
+        mid = _interp_cubic(xs, pos_next - half)
+        err = -(mid.conjugate() * (cur - prev)).real
+        err = min(max(err, -1.0), 1.0)
         integ += ki * err
         pos = pos_next + kp * err + integ
-        cur = _interp_cubic(iq, pos)
-        out.append(cur)
+        cur = _interp_cubic(xs, pos)
+        if count == len(out):
+            out = np.concatenate([out, np.empty_like(out)])
+        out[count] = cur
+        count += 1
         prev = cur
-    return np.asarray(out)
+    return out[:count]
 
 
 def _qam_levels(order):
@@ -155,21 +174,28 @@ def costas_loop(symbols, mode, bandwidth=None, order=16):
     if bandwidth is None:
         bandwidth = 0.01 if mode == "qam" else 0.03
     kp, ki = _pi_gains(bandwidth)
+    # Feedback recursion: sequential by nature. Plain-Python scalars (cmath, no per-symbol array
+    # creation) keep it fast; the decision-directed QAM slicer is inlined for the same reason.
     out = np.empty(len(symbols), dtype=np.complex128)
     phase = 0.0
     freq = 0.0
-    for n, y in enumerate(symbols):
-        z = y * np.exp(-1j * phase)
+    k = int(round(math.sqrt(order)))
+    scale = math.sqrt(2.0 * (order - 1) / 3.0)
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    for n, y in enumerate(np.asarray(symbols, dtype=np.complex128).tolist()):
+        z = y * cmath.exp(-1j * phase)
         out[n] = z
+        zr, zi = z.real, z.imag
         if mode == "bpsk":
-            err = np.sign(z.real) * z.imag
+            err = ((zr > 0) - (zr < 0)) * zi
         elif mode == "qpsk":
-            err = (np.sign(z.real) * z.imag - np.sign(z.imag) * z.real) / np.sqrt(2.0)
+            err = (((zr > 0) - (zr < 0)) * zi - ((zi > 0) - (zi < 0)) * zr) * inv_sqrt2
         else:
-            _, _, pts = _slice_qam(np.array([z]), order)
-            d = pts[0]
-            err = np.imag(z * np.conj(d)) / max(abs(d) ** 2, 1e-6)
-            err = np.clip(err, -1.0, 1.0)
+            ii = min(max(round((zr * scale + (k - 1)) / 2.0), 0), k - 1)
+            qq = min(max(round((zi * scale + (k - 1)) / 2.0), 0), k - 1)
+            d = complex(2 * ii - (k - 1), 2 * qq - (k - 1)) / scale
+            err = (z * d.conjugate()).imag / max(abs(d) ** 2, 1e-6)
+            err = min(max(err, -1.0), 1.0)
         freq += ki * err
         phase += freq + kp * err
     return out
@@ -261,3 +287,78 @@ def demodulate(iq, sample_rate, modulation, symbol_rate, differential=False):
     if modulation == "QPSK":
         return demod_qpsk(iq, sps, differential)
     return demod_qam(iq, int(modulation.split("-")[0]), sps)
+
+
+# ---- constellation quality metrics ------------------------------------------------------
+
+LINEAR_MODULATIONS = ("BPSK", "QPSK", "16-QAM", "64-QAM")
+
+
+def ideal_constellation(modulation):
+    """Unit-average-power ideal points: BPSK +-1, QPSK (+-1+-j)/sqrt2, square QAM on a grid."""
+    if modulation == "BPSK":
+        return np.array([1.0, -1.0], dtype=np.complex128)
+    if modulation == "QPSK":
+        return (np.array([1, 1, -1, -1]) + 1j * np.array([1, -1, 1, -1])) / np.sqrt(2.0)
+    if modulation in ("16-QAM", "64-QAM"):
+        order = int(modulation.split("-")[0])
+        levels, _ = _qam_levels(order)
+        scale = np.sqrt(2.0 * (order - 1) / 3.0)
+        return ((levels[:, None] + 1j * levels[None, :]) / scale).ravel()
+    raise ValueError(f"EVM applies to {LINEAR_MODULATIONS}, not {modulation!r}")
+
+
+def recover_constellation(iq, sample_rate, modulation, symbol_rate):
+    """Synchronized symbol-rate points (unit RMS) for a PSK/QAM signal: AGC, matched filter,
+    Gardner timing and Costas carrier lock. Used to measure EVM; needs >= 16 symbols."""
+    if modulation not in LINEAR_MODULATIONS:
+        raise ValueError(f"EVM applies to {LINEAR_MODULATIONS}, not {modulation!r}")
+    if symbol_rate <= 0:
+        raise ValueError("symbol_rate must be positive")
+    mode = {"BPSK": "bpsk", "QPSK": "qpsk"}.get(modulation, "qam")
+    order = int(modulation.split("-")[0]) if mode == "qam" else 16
+    return recover_symbols(iq, sample_rate / symbol_rate, mode, order=order)
+
+
+def constellation_metrics(symbols, modulation, settle=None):
+    """EVM and phase statistics of synchronized symbols against the nearest ideal point.
+
+    Symbols are scaled to unit RMS, then each is compared with its nearest ideal point
+    (decision-directed, so the 90/180-degree lock ambiguity does not matter).
+
+    Args:
+        symbols: complex symbol-rate points after timing and carrier recovery.
+        modulation: 'BPSK', 'QPSK', '16-QAM' or '64-QAM'.
+        settle: leading symbols to drop while the loops converge (default 20 % of the
+            symbols, at most 100).
+
+    Returns:
+        dict with
+            evm_rms_pct     RMS error vector / RMS reference power, in percent
+            evm_db          20*log10(EVM)
+            snr_db          -evm_db: the SNR implied by the EVM (all impairments counted as noise)
+            phase_jitter_deg  standard deviation of the symbol phase error
+            phase_offset_deg  mean phase error (residual rotation left by the carrier loop)
+            n_symbols       symbols used
+        EVM is under-estimated when SNR is so low that symbols fall in the wrong decision region.
+    """
+    z = np.asarray(symbols, dtype=np.complex128)
+    if settle is None:
+        settle = min(len(z) // 5, 100)
+    z = z[settle:]
+    if len(z) < 16:
+        raise ValueError("Need at least 16 symbols to measure EVM")
+    z = z / np.sqrt(np.mean(np.abs(z) ** 2))
+    ref = ideal_constellation(modulation)
+    nearest = ref[np.argmin(np.abs(z[:, None] - ref[None, :]), axis=1)]
+    err = z - nearest
+    evm = float(np.sqrt(np.mean(np.abs(err) ** 2) / np.mean(np.abs(nearest) ** 2)))
+    phase = np.degrees(np.angle(z * np.conj(nearest)))
+    return {
+        "evm_rms_pct": 100.0 * evm,
+        "evm_db": 20.0 * np.log10(max(evm, 1e-9)),
+        "snr_db": -20.0 * np.log10(max(evm, 1e-9)),
+        "phase_jitter_deg": float(np.std(phase)),
+        "phase_offset_deg": float(np.mean(phase)),
+        "n_symbols": int(len(z)),
+    }

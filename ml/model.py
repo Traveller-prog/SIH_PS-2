@@ -61,23 +61,38 @@ def iq_to_frames(iq, frame_len=FRAME_LEN):
     """Complex 1D array -> float32 (N, 2, frame_len) non-overlapping frames.
 
     Signals shorter than frame_len are zero-padded; a trailing partial frame is dropped.
+    The result is written straight into one pre-allocated float32 array (real and imaginary
+    parts in a single pass, no intermediate stack/astype copies).
     """
     iq = np.asarray(iq).ravel()
     if iq.size < frame_len:
         iq = np.pad(iq, (0, frame_len - iq.size))
     n = iq.size // frame_len
-    iq = iq[: n * frame_len].reshape(n, frame_len)
-    return np.stack([iq.real, iq.imag], axis=1).astype(np.float32)
+    view = iq[: n * frame_len].reshape(n, frame_len)  # view, no copy
+    out = np.empty((n, 2, frame_len), dtype=np.float32)
+    out[:, 0] = view.real
+    out[:, 1] = view.imag
+    return out
 
 
-def normalize_frames(x, eps=1e-12):
-    """Scale each (2, L) frame to unit average power so amplitude does not matter."""
-    power = (x ** 2).sum(dim=1).mean(dim=1).clamp_min(eps).sqrt()
-    return x / power[:, None, None]
+def normalize_frames(x, eps=1e-12, inplace=False):
+    """Scale each (2, L) frame to unit average power so amplitude does not matter.
+
+    The per-frame power is one vector norm (no temporary x**2 tensor). inplace=True divides the
+    input tensor itself, for callers that own it.
+    """
+    power = (torch.linalg.vector_norm(x, dim=(1, 2)) / x.shape[2] ** 0.5).clamp_min(eps)
+    return x.div_(power[:, None, None]) if inplace else x / power[:, None, None]
 
 
 class ModulationClassifier:
-    """Inference wrapper: loads trained weights and predicts modulation labels."""
+    """Inference wrapper: loads trained weights and predicts modulation labels.
+
+    The network is put in eval mode once at construction (BatchNorm uses its running statistics,
+    dropout is off), its parameters are frozen (requires_grad=False) and it is warmed up with a
+    dummy pass, so predictions never track gradients, never update state and do not pay
+    first-call setup costs.
+    """
 
     def __init__(self, weights_path=DEFAULT_WEIGHTS, device=None):
         weights_path = Path(weights_path)
@@ -90,15 +105,26 @@ class ModulationClassifier:
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         self.model.load_state_dict(state)
-        self.model.to(self.device).eval()
+        self.model.to(device=self.device, dtype=torch.float32).eval()  # inference mode for the whole app
+        self.model.requires_grad_(False)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True  # input size is fixed, so let cuDNN pick the fastest kernels
+        self._warmup()
 
     @torch.inference_mode()
+    def _warmup(self):
+        self.model(torch.zeros(1, 2, FRAME_LEN, dtype=torch.float32, device=self.device))
+
+    @torch.no_grad()
     def predict_proba(self, x):
         """Class probabilities, shape (B, num_classes).
 
         x may be a complex array (1D -> one signal, 2D -> batch of signals, each
         split into 1024-sample frames whose probabilities are averaged), or a real
         array/tensor of shape (B, 2, 1024) or (2, 1024).
+
+        Runs under torch.no_grad() (plus inference mode below) as ONE forward pass over the frames
+        of all signals, then averages each signal's frames.
         """
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
@@ -109,19 +135,23 @@ class ModulationClassifier:
             signals = x[None] if x.ndim == 1 else x
             groups = [iq_to_frames(s) for s in signals]
         else:
-            x = x.astype(np.float32)
+            x = np.asarray(x, dtype=np.float32)
             if x.ndim == 2:
                 x = x[None]
             if x.ndim != 3 or x.shape[1] != 2:
                 raise ValueError(f"Expected real input of shape (B, 2, L), got {x.shape}")
             groups = [x]
 
-        probs = []
-        for frames in groups:
-            t = normalize_frames(torch.from_numpy(frames).to(self.device))
-            p = torch.softmax(self.model(t), dim=1).cpu()
-            probs.append(p.mean(dim=0, keepdim=True) if is_complex else p)
-        return torch.cat(probs, dim=0).numpy()
+        counts = [len(g) for g in groups]
+        frames = groups[0] if len(groups) == 1 else np.concatenate(groups)
+        with torch.inference_mode():  # stricter than no_grad: also skips autograd version tracking
+            t = torch.from_numpy(np.ascontiguousarray(frames, dtype=np.float32)).to(self.device)
+            # in place only when the frames are ours (built from complex input), never a caller's array
+            t = normalize_frames(t, inplace=is_complex)
+            probs = torch.softmax(self.model(t), dim=1)
+            if is_complex:
+                probs = torch.stack([g.mean(dim=0) for g in probs.split(counts)])
+            return probs.cpu().numpy()
 
     def predict(self, x):
         """Return a list of (label, confidence_percent) tuples, one per input."""

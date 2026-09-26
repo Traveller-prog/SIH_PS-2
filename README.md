@@ -25,7 +25,10 @@ and searches the result for sync markers and frames.
 - **One-Click Auto-Analyze** — classify, pick the demodulator, estimate the baud rate, run the whole baseband
   chain and search for sync markers in one step.
 - **Protocol presets** — starting points for Marine AIS, APCO P25 and STANAG HF telemetry.
-- **Export** — analysis summary (modulation, baud rate, SNR, sync marker, extracted payloads) to JSON and CSV.
+- **Live SDR + recording** — RTL-SDR / SoapySDR (or a built-in simulated source) streams into the PSD and waterfall;
+  **Record Stream** appends every buffer to `recordings/*.iq` (float32 I/Q, sample rate in the file name).
+- **Export** — analysis summary (modulation, baud rate, SNR, sync marker, extracted payloads) to JSON and CSV, or a
+  formatted PDF report with the spectrum and constellation snapshots (`utils/pdf_exporter.py`, needs `reportlab`).
 
 ## Architecture
 
@@ -63,7 +66,7 @@ Processing chain:
 
 - Python 3.10 or newer (developed on 3.13)
 - Windows, Linux or macOS with a display (the GUI needs one)
-- Python packages: `numpy`, `scipy`, `torch`, `PyQt6`, `pyqtgraph`, `reedsolo` (`galois` is optional)
+- Python packages: `numpy`, `scipy`, `torch`, `PyQt6`, `pyqtgraph`, `reedsolo`, `reportlab` (`galois` is optional)
 
 ## Installation
 

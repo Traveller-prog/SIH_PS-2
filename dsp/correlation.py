@@ -9,7 +9,10 @@ bit array. The search slides the marker over the stream and counts bit disagreem
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.signal import correlate
+from scipy.signal import oaconvolve
+
+from fec.descrambler import SCHEMES as DESCRAMBLERS
+from fec.descrambler import descramble
 
 # Well-known markers: name -> (value, bit length)
 SYNC_WORDS = {
@@ -33,7 +36,10 @@ def parse_sync_word(word, n_bits=None):
     if isinstance(word, str):
         s = word.strip().lower().replace("_", "").replace(" ", "")
         if s.startswith("0b"):
-            return np.array([int(c) for c in s[2:]], dtype=np.uint8)
+            digits = np.frombuffer(s[2:].encode("ascii"), dtype=np.uint8) - ord("0")
+            if digits.size == 0 or np.any(digits > 1):
+                raise ValueError("binary sync word may only contain 0 and 1")
+            return digits
         s = s[2:] if s.startswith("0x") else s
         if not s:
             raise ValueError("empty sync word")
@@ -50,7 +56,8 @@ def parse_sync_word(word, n_bits=None):
     width = n_bits or width
     if value >> width:
         raise ValueError("sync word does not fit in the given bit length")
-    return np.array([(value >> (width - 1 - i)) & 1 for i in range(width)], dtype=np.uint8)
+    n_bytes = (width + 7) // 8  # big-endian bytes -> unpackbits -> keep the low `width` bits
+    return np.unpackbits(np.frombuffer(value.to_bytes(n_bytes, "big"), dtype=np.uint8))[n_bytes * 8 - width :]
 
 
 def sliding_hamming(bits, pattern):
@@ -65,11 +72,13 @@ def sliding_hamming(bits, pattern):
 
 def cross_correlate(bits, pattern):
     """Bipolar (+-1) cross-correlation, 'valid' mode. Peak value == len(pattern) at a perfect match."""
-    a = 1.0 - 2.0 * np.asarray(bits, dtype=np.float64)
-    b = 1.0 - 2.0 * np.asarray(pattern, dtype=np.float64)
+    a = 1.0 - 2.0 * np.asarray(bits, dtype=np.float32)
+    b = 1.0 - 2.0 * np.asarray(pattern, dtype=np.float32)
     if len(a) < len(b):
         return np.zeros(0)
-    return correlate(a, b, mode="valid", method="fft")
+    # overlap-add with a reversed pattern = correlation; far cheaper than one full-length FFT when
+    # the marker is short, and +-1 sums stay exact in float32 for any realistic marker length
+    return oaconvolve(a, b[::-1], mode="valid")
 
 
 @dataclass
@@ -99,20 +108,45 @@ def find_sync(bits, sync_word, n_bits=None, max_errors=0, both_polarities=True):
     cands = [(dist, False)]
     if both_polarities:
         cands.append((L - dist, True))
-    hits = []
-    for d, inv in cands:
-        hits += [(int(p), int(d[p]), inv) for p in np.flatnonzero(d <= max_errors)]
-    hits.sort(key=lambda h: (h[0]))
-    matches, best = [], None
-    for pos, err, inv in hits:
-        if best is not None and pos < best.position + L:
-            if err < best.errors:
-                best = SyncMatch(pos, err, inv, L)
-                matches[-1] = best
+    # every hit of both polarities as parallel arrays (position, errors, inverted)
+    parts = [(np.flatnonzero(d <= max_errors), inv) for d, inv in cands]
+    pos = np.concatenate([p for p, _ in parts])
+    err = np.concatenate([d[p] for (p, _), (d, _) in zip(parts, cands)]).astype(np.int64)
+    inverted = np.concatenate([np.full(p.size, inv) for p, inv in parts])
+    if pos.size == 0:
+        return []
+    order = np.argsort(pos, kind="stable")
+    pos, err, inverted = pos[order], err[order], inverted[order]
+    # hits closer than one marker length belong to the same sync event; keep its best (fewest
+    # errors, earliest) hit. Clusters whose hits all lie within one marker length of the first
+    # are resolved for all clusters at once with a lexsort; the rare longer chains (only when
+    # max_errors is so loose that random windows match) fall back to the exact greedy rule.
+    cluster = np.concatenate([[0], np.cumsum(np.diff(pos) >= L)])
+    first = np.concatenate([[0], np.flatnonzero(np.diff(cluster)) + 1])
+    last = np.concatenate([first[1:] - 1, [pos.size - 1]])
+    short = (pos[last] - pos[first]) < L
+    ranked = np.lexsort((np.arange(pos.size), err, cluster))
+    best_of = ranked[np.searchsorted(cluster[ranked], np.arange(first.size))]  # best hit of each cluster
+    kept = [best_of[short]] + [
+        first[c] + np.asarray(_greedy_collapse(pos[first[c] : last[c] + 1], err[first[c] : last[c] + 1], L), dtype=np.intp)
+        for c in np.flatnonzero(~short)  # only the rare over-long chains loop
+    ]
+    kept = np.sort(np.concatenate(kept))  # hit indices are position-ordered
+    return [SyncMatch(int(pos[k]), int(err[k]), bool(inverted[k]), L) for k in kept]
+
+
+def _greedy_collapse(pos, err, L):
+    """Original left-to-right rule: a hit inside the current best's window replaces it only if it has strictly fewer errors."""
+    kept, best = [], -1
+    for i in range(len(pos)):
+        if best >= 0 and pos[i] < pos[best] + L:
+            if err[i] < err[best]:
+                best = i
+                kept[-1] = i
             continue
-        best = SyncMatch(pos, err, inv, L)
-        matches.append(best)
-    return matches
+        best = i
+        kept.append(i)
+    return kept
 
 
 def find_any_sync(bits, words=None, max_errors=0, both_polarities=True):
@@ -169,18 +203,36 @@ class Frame:
     def to_ascii(self):
         return payload_to_ascii(self.payload)
 
+    def render(self, mode="ASCII"):
+        return render_payload(self.payload, mode)
+
     def hexdump(self):
         return hexdump(self.payload)
 
 
-def parse_frames(bits, sync_word, fmt=None, n_bits=None, max_errors=0, both_polarities=True):
+def parse_frames(bits, sync_word, fmt=None, n_bits=None, max_errors=0, both_polarities=True,
+                 descramble_scheme=None, invert=False, scope="frame"):
     """Split a bitstream into frames at each sync marker and parse header/payload.
 
     Frames matched on the complemented marker have their bits flipped before parsing.
     Frames need not be byte aligned in the stream; the bytes are read from the marker's end.
+
+    Post-processing (see fec.descrambler.SCHEMES for scheme names):
+        invert: flip the frame bits after the polarity fix (header and payload).
+        descramble_scheme: descramble with that scheme. scope='frame' (default) restarts the
+            descrambler right after each sync marker, which stays unscrambled - the usual
+            frame-synchronous case; scope='stream' descrambles the whole stream first, for
+            systems whose sync marker is scrambled too.
+        Inversion is applied before descrambling.
     """
     fmt = fmt or FrameFormat()
     bits = np.asarray(bits, dtype=np.uint8)
+    if scope not in ("frame", "stream"):
+        raise ValueError("scope must be 'frame' or 'stream'")
+    if descramble_scheme and scope == "stream":
+        bits = descramble(bits ^ 1 if invert else bits, descramble_scheme)
+        invert = False
+        descramble_scheme = None
     matches = find_sync(bits, sync_word, n_bits, max_errors, both_polarities)
     frames = []
     for i, m in enumerate(matches):
@@ -191,6 +243,10 @@ def parse_frames(bits, sync_word, fmt=None, n_bits=None, max_errors=0, both_pola
         # next-marker boundary is only authoritative when no length field exists
         if fmt.length_field is not None and i + 1 < len(matches):
             body = bits[m.end :] ^ 1 if m.inverted else bits[m.end :]
+        if invert:
+            body = body ^ 1
+        if descramble_scheme:
+            body = descramble(body, descramble_scheme)
         data = bits_to_bytes(body[: len(body) // 8 * 8])
         notes = []
         hb = fmt.header_bytes
@@ -225,6 +281,23 @@ def parse_frames(bits, sync_word, fmt=None, n_bits=None, max_errors=0, both_pola
 def payload_to_ascii(payload, replacement="."):
     """Printable ASCII view; non-printable bytes become `replacement`."""
     return "".join(chr(b) if 32 <= b < 127 else replacement for b in bytes(payload))
+
+
+PAYLOAD_MODES = ("ASCII", "UTF-8", "Raw Hex")
+
+
+def render_payload(payload, mode="ASCII"):
+    """Payload bytes as text: 'ASCII' (non-printable -> '.'), 'UTF-8' (invalid bytes -> U+FFFD,
+    control characters -> '.') or 'Raw Hex' (hex dump with an ASCII gutter)."""
+    data = bytes(payload)
+    if mode == "ASCII":
+        return payload_to_ascii(data)
+    if mode == "UTF-8":
+        text = data.decode("utf-8", errors="replace")
+        return "".join(c if c.isprintable() else "." for c in text)
+    if mode == "Raw Hex":
+        return hexdump(data)
+    raise ValueError(f"mode must be one of {PAYLOAD_MODES}")
 
 
 def hexdump(payload, width=16, offset=0):

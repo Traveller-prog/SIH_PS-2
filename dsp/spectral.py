@@ -1,7 +1,9 @@
 """Spectral analysis helpers for complex IQ arrays."""
 
 import numpy as np
-from scipy import signal
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy import fft as sfft
+from scipy import ndimage, signal
 
 _EPS = 1e-20
 
@@ -34,8 +36,8 @@ def compute_psd(iq, sample_rate, nperseg=1024, window="hann", noverlap=None, db=
         detrend=False,
         scaling="density",
     )
-    freqs = np.fft.fftshift(freqs)
-    psd = np.fft.fftshift(psd)
+    freqs = sfft.fftshift(freqs)
+    psd = sfft.fftshift(psd)
     if db:
         psd = 10.0 * np.log10(np.maximum(psd, _EPS))
     return freqs, psd
@@ -64,18 +66,19 @@ def compute_stft(iq, sample_rate, nperseg=1024, noverlap=None, window="hann", db
         boundary=None,
         padded=False,
     )
-    freqs = np.fft.fftshift(freqs)
-    mag = np.abs(np.fft.fftshift(zxx, axes=0))
+    freqs = sfft.fftshift(freqs)
+    mag = np.abs(sfft.fftshift(zxx, axes=0))
     if db:
         mag = 20.0 * np.log10(np.maximum(mag, _EPS))
     return freqs, times, mag
 
 
-def compute_constellation(iq, max_points=5000):
+def compute_constellation(iq, max_points=2000):
     """IQ scatter points normalized so that all coordinates lie in [-1, 1].
 
     The DC offset is left intact; scaling divides by the peak |I| or |Q| so the
-    aspect ratio is preserved. Long inputs are evenly decimated to max_points.
+    aspect ratio is preserved. Long inputs are thinned with a stride slice (a view, no copy) so
+    at most max_points points remain.
 
     Returns:
         (i, q): float32 arrays.
@@ -84,8 +87,7 @@ def compute_constellation(iq, max_points=5000):
     if iq.size == 0:
         raise ValueError("iq is empty")
     if max_points and iq.size > max_points:
-        idx = np.linspace(0, iq.size - 1, int(max_points)).astype(np.int64)
-        iq = iq[idx]
+        iq = iq[:: -(-iq.size // int(max_points))]
     i = iq.real.astype(np.float32)
     q = iq.imag.astype(np.float32)
     peak = max(float(np.max(np.abs(i))), float(np.max(np.abs(q))))
@@ -96,18 +98,19 @@ def compute_constellation(iq, max_points=5000):
 
 
 def _cyclic_spectrum(feature, seg_len):
-    """Averaged, windowed periodogram of a real feature (mean removed)."""
-    n = len(feature)
-    seg_len = min(seg_len, n)
-    win = np.hanning(seg_len)
-    acc = np.zeros(seg_len // 2 + 1)
-    count = 0
-    for start in range(0, n - seg_len + 1, seg_len // 2):
-        seg = feature[start : start + seg_len]
-        seg = (seg - seg.mean()) * win
-        acc += np.abs(np.fft.rfft(seg)) ** 2
-        count += 1
-    return acc / max(count, 1), seg_len
+    """Averaged, windowed periodogram of a real feature (mean removed per segment).
+
+    The 50 %-overlapping segments are a zero-copy strided view of the feature; the mean removal
+    and window are applied in place on the one temporary copy, and a single batched rFFT
+    (multi-threaded) replaces the per-segment loop.
+    """
+    feature = np.asarray(feature, dtype=np.float64)
+    seg_len = min(seg_len, len(feature))
+    segs = sliding_window_view(feature, seg_len)[:: max(seg_len // 2, 1)]
+    work = segs - segs.mean(axis=1, keepdims=True)
+    work *= np.hanning(seg_len)
+    spec = sfft.rfft(work, axis=1, overwrite_x=True, workers=-1)
+    return (spec.real ** 2 + spec.imag ** 2).mean(axis=0), seg_len
 
 
 def estimate_symbol_rate(iq, sample_rate, max_samples=262144, seg_len=16384,
@@ -211,9 +214,10 @@ def estimate_cfo(iq, sample_rate, order=4, max_samples=262144, min_score_db=15.0
         raise ValueError("Need at least 64 samples to estimate the carrier offset")
     xm = x ** order
     nfft = 1 << int(np.ceil(np.log2(x.size * 4)))
-    spec = np.abs(np.fft.fft(xm * np.hanning(x.size), nfft)) ** 2
+    z = sfft.fft(xm * np.hanning(x.size), nfft, workers=-1)
+    spec = z.real ** 2 + z.imag ** 2  # |z|^2 without the square root
     k = int(np.argmax(spec))
-    score_db = 10 * np.log10(spec[k] / max(np.median(spec), _EPS))
+    score_db = 10 * np.log10(max(spec[k], _EPS) / max(np.median(spec), _EPS))
     if score_db < min_score_db:
         raise ValueError("No carrier tone found; the modulation order may be wrong")
     a, b, c = (np.log(spec[(k + d) % nfft] + _EPS) for d in (-1, 0, 1))
@@ -238,7 +242,7 @@ def correct_cfo(iq, sample_rate, order=4, cfo_hz=None, remove_phase=False, **kwa
     x = np.asarray(iq)
     if cfo_hz is None:
         cfo_hz, _ = estimate_cfo(x, sample_rate, order, **kwargs)
-    y = x * np.exp(-2j * np.pi * cfo_hz / sample_rate * np.arange(x.size))
+    y = shift_frequency(x, -cfo_hz / sample_rate)
     if remove_phase:
         y = y * np.exp(-1j * np.angle(np.sum(y ** order)) / order)
     return y.astype(x.dtype if np.iscomplexobj(x) else np.complex64, copy=False), float(cfo_hz)
@@ -287,6 +291,22 @@ def _frame_starts(n_samples, length, max_frames, min_hop=None):
     return np.arange(0, last + 1, hop, dtype=np.int64)
 
 
+def _frame_spectra(source, starts, nperseg, window, batch=256):
+    """Yield (first_index, complex64 spectra) for frames of `source`, `batch` frames at a time.
+
+    One pre-allocated (batch, nperseg) buffer is reused for every batch: the window is applied
+    into it with out=, and the single-precision FFT runs in place (overwrite_x) on all cores.
+    The batching only bounds memory; each batch is fully vectorized.
+    """
+    w = np.asarray(window, dtype=np.float32)
+    buf = np.empty((min(batch, len(starts)), nperseg), dtype=np.complex64)
+    for i in range(0, len(starts), batch):
+        frames = source.read_frames(starts[i : i + batch], nperseg)
+        view = buf[: len(frames)]
+        np.multiply(frames, w, out=view)
+        yield i, sfft.fft(view, axis=1, overwrite_x=True, workers=-1)
+
+
 def compute_psd_from_source(source, sample_rate, nperseg=1024, max_frames=2048, window="hann",
                             db=True, batch=256):
     """Welch-style PSD averaged over frames spread evenly across the whole file.
@@ -301,11 +321,10 @@ def compute_psd_from_source(source, sample_rate, nperseg=1024, max_frames=2048, 
     starts = _frame_starts(n, nperseg, max_frames)
     w = signal.get_window(window, nperseg)
     acc = np.zeros(nperseg)
-    for i in range(0, len(starts), batch):
-        frames = source.read_frames(starts[i : i + batch], nperseg)
-        acc += np.sum(np.abs(np.fft.fft(frames * w, axis=1)) ** 2, axis=0)
-    psd = np.fft.fftshift(acc / (len(starts) * sample_rate * np.sum(w ** 2)))
-    freqs = np.fft.fftshift(np.fft.fftfreq(nperseg, 1.0 / sample_rate))
+    for _, spec in _frame_spectra(source, starts, nperseg, w, batch):
+        acc += (spec.real ** 2 + spec.imag ** 2).sum(axis=0, dtype=np.float64)
+    psd = sfft.fftshift(acc / (len(starts) * sample_rate * np.sum(w ** 2)))
+    freqs = sfft.fftshift(sfft.fftfreq(nperseg, 1.0 / sample_rate))
     if db:
         psd = 10.0 * np.log10(np.maximum(psd, _EPS))
     return freqs, psd
@@ -324,12 +343,244 @@ def compute_stft_from_source(source, sample_rate, nperseg=1024, max_frames=400, 
     starts = _frame_starts(n, nperseg, max_frames)
     w = signal.get_window(window, nperseg)
     mags = np.empty((nperseg, len(starts)))
-    for i in range(0, len(starts), 256):
-        frames = source.read_frames(starts[i : i + 256], nperseg)
-        mags[:, i : i + len(frames)] = (np.abs(np.fft.fft(frames * w, axis=1)) / np.sum(w)).T
-    mags = np.fft.fftshift(mags, axes=0)
-    freqs = np.fft.fftshift(np.fft.fftfreq(nperseg, 1.0 / sample_rate))
+    for i, spec in _frame_spectra(source, starts, nperseg, w):
+        mags[:, i : i + len(spec)] = np.hypot(spec.real, spec.imag).T / np.sum(w)
+    mags = sfft.fftshift(mags, axes=0)
+    freqs = sfft.fftshift(sfft.fftfreq(nperseg, 1.0 / sample_rate))
     times = (starts + nperseg / 2) / sample_rate
     if db:
         mags = 20.0 * np.log10(np.maximum(mags, _EPS))
     return freqs, times, mags
+
+
+def shift_frequency(x, cycles_per_sample, block=4096):
+    """Multiply x by exp(2j*pi*cycles_per_sample*n) (a frequency shift) without a full-length exp.
+
+    The rotator is built as a `block`-long ramp times one phasor per block, so only
+    block + len(x)/block complex exponentials are evaluated instead of len(x), and the
+    multiplication runs on a reshaped view of x. Returns complex64.
+    """
+    x = np.asarray(x, dtype=np.complex64)
+    n = x.size
+    n_blocks = -(-n // block)
+    padded = x if n == n_blocks * block else np.pad(x, (0, n_blocks * block - n))
+    w = 2.0 * np.pi * cycles_per_sample
+    ramp = np.exp(1j * w * np.arange(block)).astype(np.complex64)
+    steps = np.exp(1j * w * block * np.arange(n_blocks)).astype(np.complex64)
+    out = padded.reshape(n_blocks, block) * ramp
+    out *= steps[:, None]
+    return out.reshape(-1)[:n]
+
+
+def extract_band(iq, sample_rate, f_lo, f_hi, oversample=6.0, min_out=1024, max_taps=4095):
+    """Isolate the band [f_lo, f_hi] (Hz, relative to centre) as a complex baseband signal.
+
+    Mixes the band centre to 0 Hz, low-pass filters to the band width and decimates so the
+    output rate is about oversample x the bandwidth (less if that would leave fewer than
+    min_out samples). A band covering (nearly) the whole spectrum is returned unchanged.
+
+    Returns:
+        (samples complex64, new_sample_rate, decimation)
+    """
+    x = np.asarray(iq, dtype=np.complex64)
+    fs = float(sample_rate)
+    lo, hi = max(float(f_lo), -fs / 2), min(float(f_hi), fs / 2)
+    if hi <= lo:
+        raise ValueError("Empty frequency range")
+    bw, fc = hi - lo, (hi + lo) / 2
+    if bw >= 0.9 * fs and abs(fc) < 0.05 * fs:
+        return x, fs, 1
+    if x.size < 64:
+        raise ValueError("Too few samples in the selected time range")
+    x = shift_frequency(x, -fc / fs)
+    taps = int(np.clip(6 * fs / bw, 31, max_taps)) | 1
+    h = signal.firwin(taps, min(bw / 2, 0.49 * fs), fs=fs)
+    x = signal.oaconvolve(x, h, mode="same")
+    decim = int(max(1, min(fs / (oversample * bw), x.size // min_out)))
+    return x[::decim].astype(np.complex64, copy=False), fs / decim, decim  # [::decim] is a strided view
+
+
+frame_starts = _frame_starts  # public alias for callers that need to know how many frames a streaming call reads
+
+
+def compute_stft_row(iq, sample_rate, nperseg=1024, window="hann", db=True):
+    """One waterfall row from a block of samples: the power averaged over all frames in the block.
+
+    Same scaling as compute_stft (magnitude in dB). Returns (freqs_hz, row).
+    """
+    x = np.asarray(iq)
+    nperseg = min(int(nperseg), x.size)
+    if nperseg < 8:
+        raise ValueError("Need at least 8 samples")
+    n_frames = x.size // nperseg
+    frames = x[: n_frames * nperseg].reshape(n_frames, nperseg)
+    w = signal.get_window(window, nperseg)
+    power = np.mean(np.abs(sfft.fft(frames * w, axis=1) / np.sum(w)) ** 2, axis=0)
+    row = sfft.fftshift(np.sqrt(power))
+    freqs = sfft.fftshift(sfft.fftfreq(nperseg, 1.0 / sample_rate))
+    return freqs, (20.0 * np.log10(np.maximum(row, _EPS)) if db else row)
+
+
+def detect_channels(freqs, psd_db, threshold_db=8.0, train_bins=None, percentile=20.0, min_bins=3,
+                    merge_gap_hz=None, edge_db=3.0, max_channels=32):
+    """Energy detector / blind channelizer: find every active signal in a PSD.
+
+    A CFAR-style detector: the local noise floor at each bin is an order statistic (the
+    `percentile`-th value) of a wide sliding window, which stays low even when a signal
+    sits inside the window, so neighbouring signals do not mask each other. The floor is
+    calibrated so noise-only bins sit at 0 dB; bins more than `threshold_db` above it are
+    active. Active bins are merged across gaps (FSK tones, spectral nulls), short blips are
+    dropped, and each channel's edges are grown outward to where it falls within `edge_db`
+    of the floor.
+
+    Args:
+        freqs, psd_db: ascending frequency axis (Hz) and PSD in dB.
+        threshold_db: detection margin over the noise floor (higher = fewer false alarms).
+        train_bins: sliding-window length in bins (default a quarter of the spectrum).
+        min_bins: narrowest channel kept (rejects DC spikes and noise blips).
+        merge_gap_hz: gaps up to this width are bridged (default 2 % of the span).
+        max_channels: keep only the strongest this many.
+
+    Returns:
+        List of dicts sorted by centre frequency: center_hz, bandwidth_hz, f_lo, f_hi,
+        peak_hz, peak_db, snr_db (in-channel signal-to-noise ratio).
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    power = 10.0 ** (np.asarray(psd_db, dtype=np.float64) / 10.0)
+    n = power.size
+    if n < 32:
+        raise ValueError("Need at least 32 PSD bins to detect channels")
+    df = float(freqs[1] - freqs[0])
+    smooth = ndimage.uniform_filter1d(power, 3, mode="nearest")
+    train = int(train_bins or max(n // 4, 31)) | 1
+    floor = np.maximum(ndimage.percentile_filter(smooth, percentile, size=train, mode="nearest"), 1e-30)
+    ratio = smooth / floor
+    calib = float(np.median(ratio))  # noise-only bins should read 1
+    ratio = ratio / calib
+    floor_mean = floor * calib
+
+    active = ratio > 10.0 ** (threshold_db / 10.0)
+    gap = max(1, int(round((merge_gap_hz if merge_gap_hz is not None else 0.02 * n * df) / df)))
+
+    # runs of active bins -> [start, stop); bridge gaps up to `gap` bins by grouping runs
+    edges = np.flatnonzero(np.diff(active.astype(np.int8), prepend=0, append=0))
+    starts, stops = edges[::2], edges[1::2]
+    if starts.size == 0:
+        return []
+    first = np.flatnonzero(np.r_[True, (starts[1:] - stops[:-1]) > gap])
+    last = np.r_[first[1:] - 1, starts.size - 1]
+    delta = np.zeros(n + 1, dtype=np.int8)  # seeds as a boolean mask via a cumulative difference
+    delta[starts[first]] = 1
+    delta[stops[last]] = -1
+    seed = np.cumsum(delta[:-1]) > 0
+
+    # grow every seed outward through contiguous bins above the edge level: those are exactly the
+    # connected components of (seed | ratio > grow) that contain a seed
+    labels, _ = ndimage.label(seed | (ratio > 10.0 ** (edge_db / 10.0)))
+    region = np.isin(labels, np.unique(labels[seed]))
+    run_edges = np.flatnonzero(np.diff(region.astype(np.int8), prepend=0, append=0))
+    a, b = run_edges[::2], run_edges[1::2]
+    wide = (b - a) >= min_bins
+    a, b = a[wide], b[wide]
+    if a.size == 0:
+        return []
+
+    # per-channel statistics from cumulative sums / labelled reductions (no per-channel loop)
+    cum = lambda v: np.concatenate([[0.0], np.cumsum(v)])
+    excess = cum(np.maximum(smooth - floor_mean, 0.0))
+    noise = cum(floor_mean)
+    snr = 10 * np.log10(np.maximum(excess[b] - excess[a], 1e-30) / (noise[b] - noise[a]))
+    lab_runs, _ = ndimage.label(region)
+    peak_bin = np.array(ndimage.maximum_position(power, lab_runs, np.arange(1, lab_runs.max() + 1)))[:, 0]
+    peak_bin = peak_bin[wide]
+    lo, hi = freqs[a] - df / 2, freqs[b - 1] + df / 2
+    keep = np.argsort(-snr, kind="stable")[:max_channels]
+    keep = keep[np.argsort((lo + hi)[keep], kind="stable")]
+    return [
+        {"center_hz": float((lo[i] + hi[i]) / 2), "bandwidth_hz": float(hi[i] - lo[i]), "f_lo": float(lo[i]),
+         "f_hi": float(hi[i]), "peak_hz": float(freqs[peak_bin[i]]),
+         "peak_db": float(10 * np.log10(power[peak_bin[i]])), "snr_db": float(snr[i])}
+        for i in keep
+    ]
+
+
+SNR_MIN_DB, SNR_MAX_DB = 0.0, 60.0
+SPECTRAL_MIN_DB = 3.0
+
+
+def _is_clipped(x, full_scale=0.98, min_fraction=0.01):
+    """True when a noticeable share of I or Q samples sit on the ADC rail (normalized full scale is 1)."""
+    comp = np.concatenate([np.abs(x.real), np.abs(x.imag)])
+    peak = float(np.max(comp))
+    return peak >= full_scale and float(np.mean(comp >= 0.999 * peak)) > min_fraction
+
+
+def estimate_snr_safe(iq, sample_rate, nperseg=1024):
+    """SNR in dB that is always a finite float in [0, 60] - never None.
+
+    Tries the spectral energy-separation estimate (estimate_snr) first, which works for
+    oversampled, band-limited signals. If the signal fills the band or nothing stands out,
+    falls back to the blind M2M4 moment estimator, and if that is invalid too (pure noise, no
+    signal, too few samples) or the samples are clipped, returns 0.0. Results below 0 dB are
+    reported as 0.0. M2M4 assumes constant-modulus symbols, so it over- or under-reads QAM by a few dB.
+
+    Returns:
+        (snr_db, method) where method is 'spectral', 'M2M4', 'clipped' or 'default'.
+    """
+    x = np.nan_to_num(np.asarray(iq, dtype=np.complex128), nan=0.0, posinf=0.0, neginf=0.0)
+    if x.size < 100 or not np.any(x):
+        return SNR_MIN_DB, "default"
+    if _is_clipped(x):
+        return SNR_MIN_DB, "clipped"
+    seg = min(int(nperseg), x.size // 8)  # average at least ~8 frames or the noise floor is meaningless
+    for name, estimator, accept_above in (
+        # a spectral result under ~3 dB is what noise alone produces (few averaged frames), so it
+        # only counts as a signal above that; otherwise try the moment estimator
+        ("spectral", lambda: estimate_snr(x, sample_rate, nperseg=seg), SPECTRAL_MIN_DB),
+        ("M2M4", lambda: estimate_snr_m2m4(x), -np.inf),
+    ):
+        if name == "spectral" and seg < 32:
+            continue
+        try:
+            value = float(estimator())
+        except (ValueError, FloatingPointError):
+            continue
+        if np.isnan(value) or value < accept_above:
+            continue
+        return float(np.clip(value, SNR_MIN_DB, SNR_MAX_DB)), name
+    return SNR_MIN_DB, "default"
+
+
+def peak_level_db(iq, nperseg=1024):
+    """Level of the strongest spectral line in a block, in dB relative to full scale (a full-scale
+    complex tone reads 0 dB). This is the peak of compute_stft_row, the quantity the waterfall shows."""
+    _, row = compute_stft_row(iq, 1.0, nperseg)
+    return float(np.max(row))
+
+
+class SquelchGate:
+    """Squelch with hysteresis and hang time.
+
+    Opens when the level reaches threshold_db. Once open it stays open while the level is within
+    hysteresis_db below the threshold, and only closes after the level has been under that
+    lower edge for hang_s seconds, so a signal riding on the threshold does not chatter.
+    """
+
+    def __init__(self, threshold_db=-50.0, hysteresis_db=3.0, hang_s=0.4):
+        self.threshold_db, self.hysteresis_db, self.hang_s = float(threshold_db), float(hysteresis_db), float(hang_s)
+        self.is_open = False
+        self._last_above = -np.inf
+
+    def reset(self):
+        self.is_open = False
+        self._last_above = -np.inf
+
+    def update(self, level_db, t_s):
+        """Feed one level reading taken at time t_s (seconds). Returns (is_open, changed)."""
+        was_open = self.is_open
+        if level_db >= self.threshold_db or (was_open and level_db >= self.threshold_db - self.hysteresis_db):
+            self.is_open = True
+            self._last_above = t_s
+        elif was_open and t_s - self._last_above > self.hang_s:
+            self.is_open = False
+        return self.is_open, self.is_open != was_open

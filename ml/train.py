@@ -130,6 +130,7 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=0)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -141,8 +142,8 @@ def main():
     val_ds = make_dataset(args.val_per_class, rng)
     print(f"Generated {len(train_ds)} train / {len(val_ds)} val frames in {time.time() - t0:.1f}s on {device}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=256)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_ds, batch_size=256, num_workers=args.num_workers)
 
     model = AMCNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

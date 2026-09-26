@@ -4,5 +4,9 @@ torch>=2.2
 PyQt6>=6.6
 pyqtgraph>=0.13
 reedsolo>=1.7
+reportlab>=4.0
 # optional alternative Reed-Solomon backend
 galois>=0.3
+# optional live SDR backends (the toolbar also has a built-in Simulated source)
+# pyrtlsdr>=0.3
+# SoapySDR (install the system package with its Python bindings)
